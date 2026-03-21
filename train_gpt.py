@@ -66,6 +66,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    moe_experts = int(os.environ.get("MOE_EXPERTS", 1))
+    moe_deploy_expert = int(os.environ.get("MOE_DEPLOY_EXPERT", -1))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -77,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    optimizer_kind = os.environ.get("OPTIMIZER_KIND", "split")
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -174,6 +177,93 @@ class Muon(torch.optim.Optimizer):
 
         return loss
 
+
+def build_optimizers(
+    args: Hyperparameters,
+    base_model: GPT,
+) -> tuple[list[torch.optim.Optimizer], Muon | None]:
+    fused_adam = torch.cuda.is_available()
+    block_named_params = list(base_model.blocks.named_parameters())
+    matrix_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    optimizer_kind = args.optimizer_kind.lower()
+    if optimizer_kind in ("split", "muon+adam"):
+        optimizer_tok = torch.optim.Adam(
+            [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=fused_adam,
+        )
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizer_scalar = torch.optim.Adam(
+            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=fused_adam,
+        )
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+        if base_model.lm_head is not None:
+            optimizer_head = torch.optim.Adam(
+                [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=fused_adam,
+            )
+            optimizers.insert(1, optimizer_head)
+        return optimizers, optimizer_muon
+    if optimizer_kind == "adamw":
+        optimizer_muon = None
+        optimizer_tok = torch.optim.AdamW(
+            [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=0.0,
+            fused=fused_adam,
+        )
+        optimizer_matrix = torch.optim.AdamW(
+            [{"params": matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=0.0,
+            fused=fused_adam,
+        )
+        optimizer_scalar = torch.optim.AdamW(
+            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=0.0,
+            fused=fused_adam,
+        )
+        optimizers = [optimizer_tok, optimizer_matrix, optimizer_scalar]
+        if base_model.lm_head is not None:
+            optimizer_head = torch.optim.AdamW(
+                [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                weight_decay=0.0,
+                fused=fused_adam,
+            )
+            optimizers.insert(1, optimizer_head)
+        return optimizers, optimizer_muon
+    raise ValueError(f"unsupported OPTIMIZER_KIND={args.optimizer_kind}")
 
 # -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
@@ -627,6 +717,25 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class MoEMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int, experts: int, deploy_expert: int):
+        super().__init__()
+        self.experts = nn.ModuleList([MLP(dim, mlp_mult) for _ in range(experts)])
+        self.router = CastedLinear(dim, experts, bias=False)
+        self.deploy_expert = deploy_expert
+
+    def forward(self, x: Tensor) -> Tensor:
+        if 0 <= self.deploy_expert < len(self.experts):
+            return self.experts[self.deploy_expert](x)
+        route = self.router(x).argmax(dim=-1)
+        out = torch.zeros_like(x)
+        for i, expert in enumerate(self.experts):
+            mask = route == i
+            if mask.any():
+                out[mask] = expert(x[mask])
+        return out
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -636,12 +745,14 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        moe_experts: int,
+        moe_deploy_expert: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MoEMLP(dim, mlp_mult, moe_experts, moe_deploy_expert) if moe_experts > 1 else MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -672,10 +783,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        moe_experts: int,
+        moe_deploy_expert: int,
     ):
         super().__init__()
-        if logit_softcap <= 0.0:
-            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -693,6 +804,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    moe_experts,
+                    moe_deploy_expert,
                 )
                 for i in range(num_layers)
             ]
@@ -735,7 +848,8 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits + (lora.lm_head_lora(x) if lora else 0)
-        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        if self.logit_softcap > 0.0:
+            logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         if lora:
             bsz, sl, V = logits.shape
             return F.cross_entropy(
@@ -1065,6 +1179,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        moe_experts=args.moe_experts,
+        moe_deploy_expert=args.moe_deploy_expert,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1075,54 +1191,11 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    # Optimizer setup:
+    # - split: Muon on matrix params + Adam on embeddings/scalars
+    # - adamw: AdamW on all params with split learning rates
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.insert(1, optimizer_head)
+    optimizers, optimizer_muon = build_optimizers(args, base_model)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1130,7 +1203,7 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"optimizer_kind:{args.optimizer_kind} tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
@@ -1250,10 +1323,11 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        if optimizer_muon is not None:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1369,4 +1443,46 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if os.environ.get("RUN_SELF_TEST") == "1":
+        def _self_test_optimizer_kind() -> None:
+            args = Hyperparameters()
+            args.vocab_size = 64
+            args.num_layers = 2
+            args.model_dim = 64
+            args.num_heads = 4
+            args.num_kv_heads = 2
+            args.mlp_mult = 2
+            args.tie_embeddings = True
+            args.logit_softcap = 30.0
+            args.tied_embed_init_std = 0.01
+            args.qk_gain_init = 1.5
+            model = GPT(
+                vocab_size=args.vocab_size,
+                num_layers=args.num_layers,
+                model_dim=args.model_dim,
+                num_heads=args.num_heads,
+                num_kv_heads=args.num_kv_heads,
+                mlp_mult=args.mlp_mult,
+                tie_embeddings=args.tie_embeddings,
+                tied_embed_init_std=args.tied_embed_init_std,
+                logit_softcap=args.logit_softcap,
+                rope_base=args.rope_base,
+                qk_gain_init=args.qk_gain_init,
+                moe_experts=args.moe_experts,
+                moe_deploy_expert=args.moe_deploy_expert,
+            )
+
+            args.optimizer_kind = "adamw"
+            optimizers, optimizer_muon = build_optimizers(args, model)
+            assert optimizer_muon is None
+            assert all(isinstance(opt, torch.optim.AdamW) for opt in optimizers)
+
+            args.optimizer_kind = "split"
+            optimizers, optimizer_muon = build_optimizers(args, model)
+            assert optimizer_muon is not None
+            assert any(isinstance(opt, Muon) for opt in optimizers)
+
+        _self_test_optimizer_kind()
+        print("self_test:ok")
+    else:
+        main()

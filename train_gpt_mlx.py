@@ -88,6 +88,7 @@ class Hyperparameters:
     tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.05))
     matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.04))
+    optimizer_kind: str = os.environ.get("OPTIMIZER_KIND", "split")
     muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps: int = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -388,8 +389,6 @@ class GPT(nn.Module):
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float):
         super().__init__()
-        if logit_softcap <= 0.0:
-            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
 
@@ -413,6 +412,8 @@ class GPT(nn.Module):
 
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
+        if c <= 0.0:
+            return logits
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
@@ -537,6 +538,81 @@ class SplitOptimizers:
         updated.update(self.adam_scalar.apply_gradients(scalar_grads, scalar_params))
 
         model.update(tree_unflatten(list(updated.items())))
+
+
+class AdamWOptimizers:
+    # AdamW for all parameters with split learning rates for embeddings/matrices/scalars.
+    def __init__(self, model: GPT, args: Hyperparameters):
+        self.args = args
+        params = dict(tree_flatten(model.parameters()))
+        self.embed_key = "tok_emb.weight"
+        self.matrix_keys = [
+            k
+            for k, p in params.items()
+            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
+        self.scalar_keys = [
+            k
+            for k, p in params.items()
+            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+        ]
+
+        self.adam_embed = optim.AdamW(
+            learning_rate=args.tied_embed_lr,
+            betas=[args.beta1, args.beta2],
+            eps=args.adam_eps,
+            weight_decay=0.0,
+            bias_correction=True,
+        )
+        self.adam_matrix = optim.AdamW(
+            learning_rate=args.matrix_lr,
+            betas=[args.beta1, args.beta2],
+            eps=args.adam_eps,
+            weight_decay=0.0,
+            bias_correction=True,
+        )
+        self.adam_scalar = optim.AdamW(
+            learning_rate=args.scalar_lr,
+            betas=[args.beta1, args.beta2],
+            eps=args.adam_eps,
+            weight_decay=0.0,
+            bias_correction=True,
+        )
+
+    def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> None:
+        params = dict(tree_flatten(model.parameters()))
+        grads = dict(tree_flatten(grads_tree))
+        updated = dict(params)
+
+        self.adam_embed.learning_rate = self.args.tied_embed_lr * lr_mul
+        updated.update(
+            self.adam_embed.apply_gradients(
+                {self.embed_key: grads[self.embed_key]},
+                {self.embed_key: params[self.embed_key]},
+            )
+        )
+
+        self.adam_matrix.learning_rate = self.args.matrix_lr * lr_mul
+        matrix_grads = {k: grads[k] for k in self.matrix_keys}
+        matrix_params = {k: params[k] for k in self.matrix_keys}
+        if matrix_params:
+            updated.update(self.adam_matrix.apply_gradients(matrix_grads, matrix_params))
+
+        self.adam_scalar.learning_rate = self.args.scalar_lr * lr_mul
+        scalar_grads = {k: grads[k] for k in self.scalar_keys}
+        scalar_params = {k: params[k] for k in self.scalar_keys}
+        updated.update(self.adam_scalar.apply_gradients(scalar_grads, scalar_params))
+
+        model.update(tree_unflatten(list(updated.items())))
+
+
+def build_optimizer(model: GPT, args: Hyperparameters) -> SplitOptimizers | AdamWOptimizers:
+    optimizer_kind = args.optimizer_kind.lower()
+    if optimizer_kind in ("split", "muon+adam"):
+        return SplitOptimizers(model, args)
+    if optimizer_kind == "adamw":
+        return AdamWOptimizers(model, args)
+    raise ValueError(f"unsupported OPTIMIZER_KIND={args.optimizer_kind}")
 
 # ==============================================================================
 # QUANTIZATION (INT8 + ZLIB)
@@ -898,7 +974,7 @@ def main() -> None:
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
     )
-    opt = SplitOptimizers(model, args)
+    opt = build_optimizer(model, args)
 
     # ==============================================================================
     # COMPILED TRAIN / EVAL FUNCTIONS (MLX)
@@ -943,12 +1019,19 @@ def main() -> None:
         f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
-    log(
-        f"optimizer:muon+adam muon_matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
-        f"embed_lr:{args.tied_embed_lr} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
-    )
+    if isinstance(opt, SplitOptimizers):
+        log(
+            f"optimizer_kind:{args.optimizer_kind} muon_matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
+            f"embed_lr:{args.tied_embed_lr} "
+            f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+            f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
+        )
+    else:
+        log(
+            f"optimizer_kind:{args.optimizer_kind} matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
+            f"embed_lr:{args.tied_embed_lr} "
+            f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
@@ -1101,4 +1184,42 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if os.environ.get("RUN_SELF_TEST") == "1":
+        def _self_test_optimizer_kind() -> None:
+            args = Hyperparameters()
+            args.vocab_size = 64
+            args.num_layers = 2
+            args.model_dim = 64
+            args.num_heads = 4
+            args.num_kv_heads = 2
+            args.mlp_mult = 2
+            args.tie_embeddings = True
+            args.logit_softcap = 30.0
+            args.tied_embed_init_std = 0.01
+            args.qk_gain_init = 1.5
+            model = GPT(
+                vocab_size=args.vocab_size,
+                num_layers=args.num_layers,
+                dim=args.model_dim,
+                num_heads=args.num_heads,
+                num_kv_heads=args.num_kv_heads,
+                mlp_mult=args.mlp_mult,
+                logit_chunk_tokens=args.logit_chunk_tokens,
+                logit_softcap=args.logit_softcap,
+                rope_base=args.rope_base,
+                tied_embed_init_std=args.tied_embed_init_std,
+                qk_gain_init=args.qk_gain_init,
+            )
+
+            args.optimizer_kind = "adamw"
+            opt = build_optimizer(model, args)
+            assert isinstance(opt, AdamWOptimizers)
+
+            args.optimizer_kind = "split"
+            opt = build_optimizer(model, args)
+            assert isinstance(opt, SplitOptimizers)
+
+        _self_test_optimizer_kind()
+        print("self_test:ok")
+    else:
+        main()

@@ -62,12 +62,22 @@ Primary knobs:
 - `TIED_EMBED_LR`
 - `MATRIX_LR`
 - `SCALAR_LR`
+- `OPTIMIZER_KIND`
 - `MUON_MOMENTUM`
 - `MUON_BACKEND_STEPS`
 - `QK_GAIN_INIT`
 - `LOGIT_SOFTCAP`
 - `WARMDOWN_ITERS`
 - `TIED_EMBED_INIT_STD`
+
+## Experiment levers
+
+- Optimizer mode: use the `adamw_only` preset to compare AdamW vs the Muon+Adam split.
+- MoE sharding: use the `moe_shard` preset (CUDA-only) to enable the current top-1 multi-expert MLP path; true expert-parallel exchange is a follow-up.
+- Softcap off preset: use `sota_no_softcap` on CUDA to test the no-logit-cap variant directly.
+- Softcap off: `code` mode with `plain_logits`.
+- Activation swap: `code` mode with `silu_mlp` (vs the default relu^2 MLP).
+- Capacity trade-off: `MLP_MULT` (2 vs 3) is in the preset families and search space.
 
 ## Operating mode
 
@@ -94,6 +104,7 @@ Local MLX:
 ```bash
 just autoresearch-preset-mlx 5 1337 micro_smoke
 just autoresearch-preset-mlx 5 1337 small_fast
+just autoresearch-adamw-mlx 5 1337
 just autoresearch-mlx 5 1337
 just autoresearch-evolution-mlx 5 1337 6
 ```
@@ -102,6 +113,8 @@ Remote CUDA:
 
 ```bash
 just autoresearch-preset-cuda 5 1 1337 depth_first
+just autoresearch-adamw-cuda 5 1 1337
+just autoresearch-moe-cuda 5 1 1337
 just autoresearch-cuda 5 1 1337
 just autoresearch-evolution-cuda 5 1 1337 6
 just autoresearch-code-cuda 5 1 1337 plain_logits

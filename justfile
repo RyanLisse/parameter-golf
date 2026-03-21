@@ -54,12 +54,24 @@ autoresearch-preset-mlx trials="5" seed="1337" preset="":
         uv run python3 autoresearch/run_search.py --backend mlx --mode preset --trials {{trials}} --seed {{seed}}; \
     fi
 
+autoresearch-adamw-mlx trials="5" seed="1337":
+    uv run python3 autoresearch/run_search.py --backend mlx --mode preset --trials {{trials}} --seed {{seed}} --preset adamw_only
+
 autoresearch-preset-cuda trials="5" nproc="1" seed="1337" preset="":
     @if [ -n "{{preset}}" ]; then \
         uv run python3 autoresearch/run_search.py --backend cuda --mode preset --trials {{trials}} --nproc {{nproc}} --seed {{seed}} --preset {{preset}}; \
     else \
         uv run python3 autoresearch/run_search.py --backend cuda --mode preset --trials {{trials}} --nproc {{nproc}} --seed {{seed}}; \
     fi
+
+autoresearch-adamw-cuda trials="5" nproc="1" seed="1337":
+    uv run python3 autoresearch/run_search.py --backend cuda --mode preset --trials {{trials}} --nproc {{nproc}} --seed {{seed}} --preset adamw_only
+
+autoresearch-moe-cuda trials="5" nproc="1" seed="1337":
+    uv run python3 autoresearch/run_search.py --backend cuda --mode preset --trials {{trials}} --nproc {{nproc}} --seed {{seed}} --preset moe_shard
+
+autoresearch-no-softcap-cuda trials="5" nproc="1" seed="1337":
+    uv run python3 autoresearch/run_search.py --backend cuda --mode preset --trials {{trials}} --nproc {{nproc}} --seed {{seed}} --preset sota_no_softcap
 
 autoresearch-evolution-mlx trials="5" seed="1337" population="6":
     uv run python3 autoresearch/run_search.py --backend mlx --mode evolution --trials {{trials}} --seed {{seed}} --population {{population}} --resume

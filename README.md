@@ -89,12 +89,15 @@ just mlx-train mlx_run 2000 524288 0 524288
 just autoresearch-mlx 5 1337
 just autoresearch-preset-mlx 5 1337 micro_smoke
 just autoresearch-preset-mlx 5 1337 small_fast
+just autoresearch-adamw-mlx 5 1337
 just autoresearch-evolution-mlx 5 1337 6
 just autoresearch-code-mlx 5 1337 gelu_mlp
 just setup-cuda
 just torch-train baseline_sp1024 1
 just autoresearch-cuda 5 1 1337
 just autoresearch-preset-cuda 5 1 1337 depth_first
+just autoresearch-adamw-cuda 5 1 1337
+just autoresearch-moe-cuda 5 1 1337
 just autoresearch-evolution-cuda 5 1 1337 6
 just autoresearch-code-cuda 5 1 1337 plain_logits
 ```
@@ -134,12 +137,22 @@ Recommended order of use:
 3. Validate promising families on CUDA with `preset` or `random`.
 4. Use CUDA `evolution` and `code` once you want stronger exploitation or mutation-based search.
 
+Experiment levers that map cleanly onto the harness:
+
+- `adamw_only` presets (`just autoresearch-adamw-mlx` / `just autoresearch-adamw-cuda`) to compare against the Muon+Adam split.
+- `moe_shard` preset (`just autoresearch-moe-cuda`) to try the CUDA MoE path. The current implementation is top-1 routed and single-process; true expert-parallel exchange is a follow-up.
+- `sota_no_softcap` preset (`just autoresearch-no-softcap-cuda`) to test the no-logit-cap variant from the MLX findings.
+- `plain_logits` code mutation (`just autoresearch-code-cuda 5 1 1337 plain_logits`) to disable logit softcap.
+- `silu_mlp` code mutation (`just autoresearch-code-cuda 5 1 1337 silu_mlp`) for activation comparisons.
+- `MLP_MULT` (2 vs 3) is already in preset families and search space for direct capacity trade-offs.
+
 For Apple Silicon local iteration, start with:
 
 ```bash
 just autoresearch-mlx 5 1337
 just autoresearch-preset-mlx 5 1337 micro_smoke
 just autoresearch-preset-mlx 5 1337 small_fast
+just autoresearch-adamw-mlx 5 1337
 ```
 
 To run evolutionary search locally:
@@ -153,6 +166,8 @@ For CUDA search on a remote machine:
 ```bash
 just autoresearch-cuda 5 1 1337
 just autoresearch-preset-cuda 5 1 1337 depth_first
+just autoresearch-adamw-cuda 5 1 1337
+just autoresearch-moe-cuda 5 1 1337
 just autoresearch-evolution-cuda 5 1 1337 6
 just autoresearch-code-cuda 5 1 1337 plain_logits
 ```

@@ -263,6 +263,30 @@ class RunSearchPersistenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing cuda total submission size metric"):
                 run_search.parse_metrics(log_text, "cuda", script_path)
 
+    def test_optimizer_kind_is_exposed_in_search_choices_and_presets(self) -> None:
+        for backend in ("mlx", "cuda"):
+            self.assertIn("OPTIMIZER_KIND", run_search.SEARCH_CHOICES[backend])
+            self.assertIn("adamw_only", run_search.PRESETS[backend])
+            self.assertEqual("adamw", run_search.PRESETS[backend]["adamw_only"]["OPTIMIZER_KIND"])
+
+    def test_moe_preset_and_search_choices_are_cuda_only(self) -> None:
+        self.assertIn("MOE_EXPERTS", run_search.SEARCH_CHOICES["cuda"])
+        self.assertIn("MOE_DEPLOY_EXPERT", run_search.SEARCH_CHOICES["cuda"])
+        self.assertNotIn("MOE_EXPERTS", run_search.SEARCH_CHOICES["mlx"])
+        self.assertNotIn("MOE_DEPLOY_EXPERT", run_search.SEARCH_CHOICES["mlx"])
+        self.assertIn("moe_shard", run_search.PRESETS["cuda"])
+        moe_preset = run_search.PRESETS["cuda"]["moe_shard"]
+        self.assertGreater(int(moe_preset["MOE_EXPERTS"]), 1)
+        self.assertIn("MOE_DEPLOY_EXPERT", moe_preset)
+        self.assertEqual("split", moe_preset["OPTIMIZER_KIND"])
+
+    def test_sota_no_softcap_preset_tests_logit_cap_off(self) -> None:
+        self.assertIn("sota_no_softcap", run_search.PRESETS["cuda"])
+        preset = run_search.PRESETS["cuda"]["sota_no_softcap"]
+        self.assertEqual("adamw", preset["OPTIMIZER_KIND"])
+        self.assertEqual("0.0", preset["LOGIT_SOFTCAP"])
+        self.assertEqual("3", preset["MLP_MULT"])
+
     def test_apply_code_mutation_missing_target_raises(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing mutation target"):
             run_search.apply_code_mutation("print('unchanged')\n", "cuda", "gelu_mlp")
