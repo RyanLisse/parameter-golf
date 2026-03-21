@@ -104,7 +104,7 @@ just autoresearch-code-cuda 5 1 1337 plain_logits
 
 ### Autoresearch Modes
 
-This repo also includes a lightweight adaptation of [`karpathy/autoresearch`](https://github.com/karpathy/autoresearch) for automated hyperparameter search against the challenge objective.
+This repo also includes a lightweight adaptation of [`karpathy/autoresearch`](https://github.com/karpathy/autoresearch) for automated hyperparameter search against the challenge objective. The upstream lesson is that `program.md` is the real control surface; this repo keeps that agent-instructions contract but adds explicit search modes and persisted trial history so runs can be resumed and compared across backends.
 
 The local harness lives in `autoresearch/run_search.py` and supports four explicit search modes:
 

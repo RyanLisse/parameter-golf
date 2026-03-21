@@ -2,6 +2,18 @@
 
 This repo uses a lightweight adaptation of `karpathy/autoresearch`.
 
+## Upstream reference
+
+Karpathy's original autoresearch is the reference protocol behind this harness:
+
+- one mutable training file per experiment
+- a fixed 5-minute wallclock budget
+- `program.md` as the instruction surface the agent keeps iterating on
+- keep-or-revert via git when an experiment does not improve
+- one primary metric, `val_bpb`, and one GPU at a time
+
+This repo keeps the same research-org mindset, but layers on explicit `random`, `preset`, `evolution`, and `code` modes plus TSV/JSON trial history so MLX and CUDA runs are easy to resume, compare, and share.
+
 ## Goal
 
 Minimize held-out FineWeb validation loss indirectly through the challenge metric `val_bpb`, while respecting:
