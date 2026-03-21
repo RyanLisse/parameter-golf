@@ -2,11 +2,10 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
+Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
 """
 from __future__ import annotations
 
-import gc
 import glob
 import json
 import math
@@ -16,7 +15,6 @@ import sys
 import time
 import uuid
 import zlib
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
@@ -61,6 +59,10 @@ class Hyperparameters:
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
+    # Force MLX to materialize the graph after every sub-batch, preventing lazy
+    # graph buildup across accumulation steps. Keeps peak memory low on 16GB machines.
+    # Disable on 32GB+ unified memory for better throughput (MLX_EAGER_EVAL=0).
+    mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
@@ -93,11 +95,6 @@ class Hyperparameters:
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
-    mlx_compile_sanity_only: bool = bool(int(os.environ.get("MLX_COMPILE_SANITY_ONLY", "0")))
-    mlx_skip_validation: bool = bool(int(os.environ.get("MLX_SKIP_VALIDATION", "0")))
-    mlx_validate_only: bool = bool(int(os.environ.get("MLX_VALIDATE_ONLY", "0")))
-    val_eval_max_seqs: int = int(os.environ.get("VAL_EVAL_MAX_SEQS", "0"))
-    mlx_eval_clear_cache: bool = bool(int(os.environ.get("MLX_EVAL_CLEAR_CACHE", "1")))
 
     @property
     def train_files(self) -> str:
@@ -342,31 +339,16 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # Baseline relu^2 MLP with optional PowerInfer-style top-k activation sparsity.
+    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = dim * mlp_mult
-        self.hidden_dim = hidden
-        self.topk_ratio = float(os.environ.get("SPARSE_FFN_TOPK_RATIO", "0.5"))
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = nn.relu(self.fc(x))
-        x = x * x
-        if self.topk_ratio >= 1.0:
-            return self.proj(x)
-
-        # Keep only top-k hidden activations per token to reduce FFN compute.
-        k = max(1, int(self.hidden_dim * self.topk_ratio))
-        flat = x.reshape(-1, self.hidden_dim)
-        # Use a per-row threshold mask to avoid non-compiled scatter paths.
-        row_sorted = mx.sort(flat, axis=-1)
-        threshold = row_sorted[:, self.hidden_dim - k][:, None]
-        keep_mask = (flat >= threshold).astype(flat.dtype)
-        sparse_flat = flat * keep_mask
-        proj_w_t = self.proj.weight.astype(sparse_flat.dtype).T
-        return (sparse_flat @ proj_w_t).reshape(*x.shape[:-1], self.proj.weight.shape[0])
+        return self.proj(x * x)
 
 
 class Block(nn.Module):
@@ -386,13 +368,11 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-        # Keep residual mixing constants as Python floats to avoid array-eval issues
-        # under MLX compile transformations.
-        self.resid_lambda = 0.9
-        self.x0_lambda = 0.0
+        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
-        x = self.resid_lambda * x + self.x0_lambda * x0
+        mix = self.resid_mix.astype(x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -773,6 +753,8 @@ def loss_and_grad_chunked(
         scale = float(y.size) / total_tokens
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
+        if args.mlx_eager_eval:
+            mx.eval(loss_value, grad_accum)  # materialize each chunk to cap peak memory
     return loss_value, tree_unflatten(list(grad_accum.items()))
 
 
@@ -783,13 +765,11 @@ def eval_val(
     base_bytes_lut: np.ndarray,
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
+    log_fn: Callable[[str], None] | None = None,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
-    if args.mlx_eval_clear_cache:
-        gc.collect()
-        mx.clear_cache()
     val_batch_tokens = args.val_batch_size // args.grad_accum_steps
     if val_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -799,12 +779,12 @@ def eval_val(
         )
     val_batch_seqs = val_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.size - 1) // args.train_seq_len
-    total_loss = 0.0
+    total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
+    total_loss_sum = 0.0
     total_tokens = 0.0
     total_bytes = 0.0
-    eval_total_seqs = min(total_seqs, args.val_eval_max_seqs) if args.val_eval_max_seqs > 0 else total_seqs
-    for batch_seq_start in range(0, eval_total_seqs, val_batch_seqs):
-        batch_seq_end = min(batch_seq_start + val_batch_seqs, eval_total_seqs)
+    for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
+        batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
         raw_end = batch_seq_end * args.train_seq_len + 1
         chunk = val_tokens[raw_start:raw_end]
@@ -813,8 +793,9 @@ def eval_val(
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
         chunk_token_count = float(y.size)
-        batch_loss = float(compiled_loss(x, y).item())
-        total_loss += batch_loss * chunk_token_count
+        batch_loss = compiled_loss(x, y).astype(mx.float32)
+        mx.eval(batch_loss)
+        total_loss_sum += float(batch_loss.item()) * chunk_token_count
         prev_ids = x_np.reshape(-1)
         tgt_ids = y_np.reshape(-1)
         bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
@@ -823,45 +804,14 @@ def eval_val(
         ).astype(np.int16, copy=False)
         total_tokens += chunk_token_count
         total_bytes += float(bytes_np.astype(np.float64).sum())
-    val_loss = total_loss / total_tokens
+        if log_fn is not None and total_batches > 1 and (
+            batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
+        ):
+            log_fn(f"val_progress:{batch_idx}/{total_batches}")
+    val_loss = total_loss_sum / total_tokens
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
     return val_loss, val_bpb
-
-
-def run_quantized_roundtrip_eval(
-    args: Hyperparameters,
-    log: Callable[[str], None],
-    model: GPT,
-    compiled_loss,
-    val_tokens: np.ndarray,
-    base_bytes_lut: np.ndarray,
-    has_leading_space_lut: np.ndarray,
-    is_boundary_token_lut: np.ndarray,
-    out_dir: Path,
-) -> None:
-    log("mlx_validate_only:starting quantized roundtrip evaluation")
-    quant_path = out_dir / f"{args.run_id}_mlx_model.int8.ptz"
-    with quant_path.open("rb") as f:
-        quant_blob_disk = f.read()
-    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
-    model.update(tree_unflatten(list(quant_flat.items())))
-    gc.collect()
-    mx.clear_cache()
-    quant_file_bytes = quant_path.stat().st_size
-    log(f"serialized_model_int8_zlib:{quant_file_bytes} bytes")
-    q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        compiled_loss,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
-    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 # -----------------------------
 # TRAINING
@@ -899,13 +849,12 @@ def main() -> None:
         with logfile.open("a", encoding="utf-8") as f:
             print(msg, file=f)
 
-    if not args.mlx_validate_only:
-        code = Path(__file__).read_text(encoding="utf-8")
-        log(code, console=False)
-        log("=" * 100, console=False)
-        log(f"Running Python {sys.version}", console=False)
-        log(f"Running MLX {mx.__version__}", console=False)
-        log("=" * 100, console=False)
+    code = Path(__file__).read_text(encoding="utf-8")
+    log(code, console=False)
+    log("=" * 100, console=False)
+    log(f"Running Python {sys.version}", console=False)
+    log(f"Running MLX {mx.__version__}", console=False)
+    log("=" * 100, console=False)
 
     if not args.tie_embeddings:
         raise NotImplementedError("train_gpt_mlx.py only supports tied embeddings")
@@ -965,20 +914,6 @@ def main() -> None:
         outputs=model.state,
     )
 
-    if args.mlx_validate_only:
-        run_quantized_roundtrip_eval(
-            args,
-            log,
-            model,
-            compiled_loss,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            out_dir,
-        )
-        return
-
     # Print config once so logs are self-describing.
     n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
     log(f"run_id:{args.run_id}")
@@ -1021,22 +956,6 @@ def main() -> None:
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
-    if args.val_eval_max_seqs > 0:
-        log(f"val_eval:truncated max_seqs:{args.val_eval_max_seqs}")
-
-    if args.mlx_compile_sanity_only:
-        # Fast compile validation path to confirm model/loss/grad graphs run without
-        # paying full validation or serialization cost.
-        x, y = train_loader.next_batch(args.train_seq_len, args.train_seq_len)
-        sanity_loss, sanity_grads = compiled_loss_and_grad(x, y)
-        sanity_eval_loss = compiled_loss(x, y)
-        mx.eval(sanity_loss, sanity_eval_loss, sanity_grads)
-        mx.synchronize()
-        log(
-            f"mlx_compile_sanity_only:ok loss:{float(sanity_loss.item()):.6f} "
-            f"eval_loss:{float(sanity_eval_loss.item()):.6f}"
-        )
-        return
 
     # ==============================================================================
     # TRAINING LOOP
@@ -1083,7 +1002,8 @@ def main() -> None:
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-        if (not args.mlx_skip_validation) and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
                 args,
@@ -1092,8 +1012,8 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                log_fn=log,
             )
-            train_time_ms += 1000.0 * (time.perf_counter() - t0)
             if step % 25 == 0 or last_step:
                 log(
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1103,8 +1023,6 @@ def main() -> None:
         if last_step:
             if stop_after_step is not None and step < args.iterations:
                 log(f"stopping_early: wallclock_cap train_time:{train_time_ms:.0f}ms step:{step}/{args.iterations}")
-            elif args.mlx_skip_validation:
-                log(f"mlx_skip_validation: last_step reached at step:{step}/{args.iterations}")
             break
 
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
@@ -1117,6 +1035,8 @@ def main() -> None:
             loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
+            if args.mlx_eager_eval:
+                mx.eval(train_loss, accum)  # materialize each microbatch to cap peak memory
 
         grads = tree_unflatten(list(accum.items()))
         grads = clip_grad_tree(grads, args.grad_clip_norm)
@@ -1139,10 +1059,6 @@ def main() -> None:
     # ==============================================================================
     # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
     # ==============================================================================
-    if args.mlx_skip_validation:
-        log("mlx_skip_validation: skipping final serialization + quantized roundtrip eval")
-        return
-
     # We always write a raw artifact and a quantized artifact, then validate the
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
@@ -1165,10 +1081,23 @@ def main() -> None:
         f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
     )
 
-    eval_env = os.environ.copy()
-    eval_env["MLX_VALIDATE_ONLY"] = "1"
-    eval_env["PYTHONUNBUFFERED"] = "1"
-    subprocess.run([sys.executable, str(Path(__file__))], cwd=Path(__file__).resolve().parent, env=eval_env, check=True)
+    with quant_path.open("rb") as f:
+        quant_blob_disk = f.read()
+    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+    model.update(tree_unflatten(list(quant_flat.items())))
+    q_t0 = time.perf_counter()
+    q_val_loss, q_val_bpb = eval_val(
+        args,
+        compiled_loss,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        log_fn=log,
+    )
+    q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
+    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
+    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
