@@ -1,0 +1,49 @@
+name: Symphony Orchestrator
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Every 5 minutes
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      dry_run:
+        description: 'Dry run mode'
+        type: boolean
+        default: false
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run Symphony orchestrator
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            uv run python scripts/symphony.py --once --dry-run
+          else
+            uv run python scripts/symphony.py --once
+          fi
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: symphony-logs-${{ github.run_id }}
+          path: |
+            logs/symphony/*.log
+            logs/symphony/*.json
+          retention-days: 7

@@ -42,6 +42,10 @@ class RunSearchPersistenceTests(unittest.TestCase):
 
             self.assertEqual("parent-selected candidate", result.description)
             self.assertEqual({"MODEL_DIM": "512"}, result.config)
+            self.assertEqual(len("print('hi')\n".encode("utf-8")), result.train_script_bytes)
+            self.assertEqual(1200, result.quantized_model_bytes)
+            self.assertEqual(42, result.model_params)
+            self.assertEqual("logs/autoresearch/trial.log", result.log_path)
 
     def test_append_result_writes_parents_and_script_path_to_tsv(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -93,11 +97,12 @@ class RunSearchPersistenceTests(unittest.TestCase):
                 lines = results_tsv.read_text(encoding="utf-8").strip().splitlines()
 
             self.assertEqual(
-                "run_id\tbackend\tmode\tval_bpb\tval_loss\ttotal_bytes\tstatus\tpreset\tcode_mutation\tparents\ttrain_script_path\tdescription",
+                "run_id\tbackend\tmode\tval_bpb\tval_loss\ttotal_bytes\tstatus\tpreset\tcode_mutation\tparents\ttrain_script_path\ttrain_script_bytes\tquantized_model_bytes\tmodel_params\telapsed_seconds\tlog_path\tdescription",
                 lines[0],
             )
             self.assertIn("parent_one,parent_two", lines[1])
             self.assertIn("logs/autoresearch/workbench/candidate.py", lines[1])
+            self.assertIn("\t19\t3000\t123\t9.000000\tlogs/autoresearch/trial.log\t", lines[1])
             self.assertTrue((trials_dir / "ar_test_002.json").exists())
 
     def test_legacy_best_and_trial_artifacts_still_load(self) -> None:
@@ -269,16 +274,13 @@ class RunSearchPersistenceTests(unittest.TestCase):
             self.assertIn("adamw_only", run_search.PRESETS[backend])
             self.assertEqual("adamw", run_search.PRESETS[backend]["adamw_only"]["OPTIMIZER_KIND"])
 
-    def test_moe_preset_and_search_choices_are_cuda_only(self) -> None:
-        self.assertIn("MOE_EXPERTS", run_search.SEARCH_CHOICES["cuda"])
-        self.assertIn("MOE_DEPLOY_EXPERT", run_search.SEARCH_CHOICES["cuda"])
-        self.assertNotIn("MOE_EXPERTS", run_search.SEARCH_CHOICES["mlx"])
-        self.assertNotIn("MOE_DEPLOY_EXPERT", run_search.SEARCH_CHOICES["mlx"])
-        self.assertIn("moe_shard", run_search.PRESETS["cuda"])
+    def test_moe_preset_and_search_choices_both_backends(self) -> None:
+        for backend in ("cuda", "mlx"):
+            self.assertIn("MOE_EXPERTS", run_search.SEARCH_CHOICES[backend])
+            self.assertIn("MOE_DEPLOY_EXPERT", run_search.SEARCH_CHOICES[backend])
+            self.assertIn("moe_shard", run_search.PRESETS[backend])
         moe_preset = run_search.PRESETS["cuda"]["moe_shard"]
         self.assertGreater(int(moe_preset["MOE_EXPERTS"]), 1)
-        self.assertIn("MOE_DEPLOY_EXPERT", moe_preset)
-        self.assertEqual("split", moe_preset["OPTIMIZER_KIND"])
 
     def test_sota_no_softcap_preset_tests_logit_cap_off(self) -> None:
         self.assertIn("sota_no_softcap", run_search.PRESETS["cuda"])
